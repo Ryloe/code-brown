@@ -4,12 +4,23 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
-from dotenv import load_dotenv
+from supabase import create_client
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from ev.ev import set_store as set_ev_store
+from scraper.scraper import set_store as set_scraper_store
+from shared.store import ListingStore
 
 load_dotenv()
 
@@ -24,6 +35,17 @@ def _is_public_path(path: str) -> bool:
 async def lifespan(app: FastAPI):
     if not API_KEY:
         raise RuntimeError("API_KEY environment variable must be set and non-empty")
+    supabase_url = os.environ.get("SUPABASE_URL", "").strip()
+    service_role = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not supabase_url or not service_role:
+        raise RuntimeError(
+            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set and non-empty"
+        )
+    client = create_client(supabase_url, service_role)
+    store = ListingStore(client)
+    app.state.store = store
+    set_scraper_store(store)
+    set_ev_store(store)
     yield
 
 
