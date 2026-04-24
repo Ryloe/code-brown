@@ -1,0 +1,2 @@
+# Intentionally minimal.
+# Root `.gitignore` in repo handles shared Next.js + Python ignore rules.
