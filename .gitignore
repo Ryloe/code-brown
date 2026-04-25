@@ -20,7 +20,7 @@ pnpm-debug.log*
 !.env.sample
 
 # Python
-__pycache__/
+**/__pycache__/**
 *.py[cod]
 *.pyo
 *.pyd
