@@ -1,0 +1,137 @@
+"""CLI test harness for the backend orchestrator.
+
+  python -m backend.cli search        # interactive SearchParams prompt
+  python -m backend.cli hype <term>   # one-shot hype lookup
+
+This file contains zero business logic. It exists to drive
+``backend.orchestrator`` from a terminal so we can verify wiring before
+any HTTP handlers are written.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+
+from dotenv import load_dotenv
+
+from backend import orchestrator
+from hype.cli import _print_summary as _print_hype_summary
+from scraper.cli import _prompt_params
+from shared.models import RankedListing, SearchResponse
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CLI harness for backend orchestrator.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser("search", help="Run search flow")
+    search_parser.add_argument("--json", action="store_true", help="Print raw JSON response")
+
+    hype_parser = subparsers.add_parser("hype", help="Run hype flow")
+    hype_parser.add_argument("term", help="Term to evaluate")
+    hype_parser.add_argument("--json", action="store_true", help="Print raw JSON response")
+
+    return parser
+
+
+def _fmt_money(value: float | int) -> str:
+    return f"${float(value):.2f}"
+
+
+def _print_ranked_line(item: RankedListing, idx: int, total: int) -> None:
+    live = item.live_listing
+    val = item.valuation
+    dist = val["dist"]
+    metrics = val["metrics"]
+    sp = item.sell_probability
+
+    print(f"[{idx}/{total}] {live.designer} {live.name}  (id={live.id})  url={live.url}")
+    print(
+        " ".join(
+            [
+                f"cost={_fmt_money(val['cost'])}",
+                f"q10={_fmt_money(dist['q10'])}",
+                f"q50={_fmt_money(dist['q50'])}",
+                f"q90={_fmt_money(dist['q90'])}",
+                f"edge={_fmt_money(metrics['edge_usd'])} ({metrics['percent_under']:.2f}%)",
+                f"confidence={metrics['confidence']}",
+                f"effective_n={metrics['effective_n']}",
+            ]
+        )
+    )
+    q50_comp = sp.get("q50_comp_price")
+    print(
+        " ".join(
+            [
+                f"p_sell={sp['p_sell']:.4f}",
+                f"median_days={sp['median_days_to_sell']:.2f}",
+                f"adjusted_days={sp['adjusted_days_to_sell']:.2f}",
+                f"pricing_ratio={sp['pricing_ratio']:.4f}",
+                f"q50_comp={_fmt_money(q50_comp) if q50_comp is not None else '—'}",
+                f"comps={sp['num_valid_time_comps']}/{sp['num_sold_comps']}",
+            ]
+        )
+    )
+
+
+def _print_search_response(response: SearchResponse) -> None:
+    print("metadata")
+    print(json.dumps(response.metadata.model_dump(mode="json"), indent=2))
+    print()
+
+    if not response.ranked:
+        print("no rankable listings (all comp searches returned no_data)")
+        return
+
+    total = len(response.ranked)
+    for idx, item in enumerate(response.ranked, start=1):
+        _print_ranked_line(item, idx, total)
+        if idx < total:
+            print()
+
+
+def _run_search(as_json: bool) -> int:
+    try:
+        params = _prompt_params()
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted", file=sys.stderr)
+        return 130
+
+    response = asyncio.run(orchestrator.run_search(params))
+    if as_json:
+        print(response.model_dump_json(indent=2))
+    else:
+        _print_search_response(response)
+    return 0
+
+
+def _run_hype(term: str, as_json: bool) -> int:
+    result = asyncio.run(orchestrator.run_hype(term))
+    if as_json:
+        print(result.model_dump_json(indent=2))
+    else:
+        _print_hype_summary(result)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "search":
+            return _run_search(as_json=args.json)
+        if args.command == "hype":
+            return _run_hype(term=args.term, as_json=args.json)
+        parser.print_help()
+        return 1
+    except Exception as exc:  # pragma: no cover
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
