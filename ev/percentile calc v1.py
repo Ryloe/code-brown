@@ -139,9 +139,9 @@ def value_listing(row: Dict, scraped_at: int) -> Dict:
         "name": live["name"],
         "cost": total_cost,
         "dist": {
-            "p10_floor": round(p10, 2),
-            "p50_fair": round(p50, 2),
-            "p90_max": round(p90, 2)
+            "q10": round(p10, 2),
+            "q50": round(p50, 2),
+            "q90": round(p90, 2)
         },
         "metrics": {
             "edge_usd": round(p50 - total_cost, 2),

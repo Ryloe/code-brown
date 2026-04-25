@@ -1,0 +1,189 @@
+# EV Model Spec
+
+This document specifies the behavior of:
+
+- `ev/percentile calc v1.py`
+- `ev/sell probablity model.py`
+
+It is intended to make integration behavior explicit and reduce ambiguity when wiring outputs into backend/frontend code.
+
+## 1) Scope
+
+These modules estimate value and liquidity for a single `GrailedResultRow`:
+
+- `percentile calc v1.py` computes a weighted price distribution and edge metrics.
+- `sell probablity model.py` estimates short-horizon probability of sale.
+
+Both modules are pure compute modules with no network or database I/O.
+
+## 2) Shared Input Shape
+
+Both modules consume one row shaped like:
+
+```python
+{
+  "live_listing": {...},
+  "sold_comparables": [{...}, ...]
+}
+```
+
+Expected fields used by these models:
+
+- `live_listing.price.listing_price_usd`
+- `live_listing.price.shipping_price_usd`
+- `live_listing.designer`
+- `live_listing.size`
+- `live_listing.condition_raw`
+- `live_listing.id`
+- `live_listing.name`
+- `sold_comparables[*].designer`
+- `sold_comparables[*].size`
+- `sold_comparables[*].condition_raw`
+- `sold_comparables[*].sold_at_unix`
+- `sold_comparables[*].price.sold_price_usd`
+- `sold_comparables[*].price.shipping_price_usd`
+- `sold_comparables[*].seller.reviews_count`
+- `sold_comparables[*].seller.transactions_count`
+- `sold_comparables[*].seller.badges.verified`
+- `sold_comparables[*].seller.badges.trusted_seller`
+- `sold_comparables[*].seller.posted_at_unix` (sell probability model only)
+
+## 3) Percentile Valuation Model (`percentile calc v1.py`)
+
+### 3.1 Core API
+
+- `value_listing(row: Dict, scraped_at: int) -> Dict`
+- `process_scrape(data: Dict) -> List[Dict]`
+
+`process_scrape` iterates `data["results"]` and calls `value_listing` for each row, using `data["metadata"]["scraped_at_unix"]`.
+
+### 3.2 Weighting Components
+
+Comparable weight is a product of four terms:
+
+`w = condition_weight * size_weight * recency_weight * seller_score`
+
+Definitions:
+
+- `condition_weight = exp(-alpha * abs(rank(target_cond) - rank(comp_cond)))`, `alpha=1.2`
+- `size_weight = exp(-beta * abs(target_size - comp_size))`, `beta=0.6`, fallback `0.70` if size parse fails
+- `recency_weight = exp(-gamma * days_ago)`, `gamma=0.005`
+- `seller_score = 0.8 + 0.2 * min(trust_factor, 1.0) + badge_bonus`
+
+Only comparables with same designer are considered. Rows with `w <= 0.01` are dropped.
+
+### 3.3 Price Distribution
+
+For each valid comparable:
+
+- `sold_total = sold_price_usd + shipping_price_usd`
+
+Weighted percentiles are computed from `(sold_total, w)`:
+
+- `q10 = weighted_percentile(..., 10)`
+- `q50 = weighted_percentile(..., 50)`
+- `q90 = weighted_percentile(..., 90)`
+
+Effective sample size uses Kish ESS:
+
+- `effective_n = (sum(w)^2) / sum(w^2)`
+
+Confidence buckets:
+
+- `low` if `effective_n <= 8`
+- `medium` if `8 < effective_n <= 15`
+- `high` if `effective_n > 15`
+
+### 3.4 Output Contract
+
+Success shape:
+
+```python
+{
+  "id": str,
+  "name": str,
+  "cost": float,  # listing + shipping
+  "dist": {
+    "q10": float,
+    "q50": float,
+    "q90": float
+  },
+  "metrics": {
+    "edge_usd": float,        # q50 - cost
+    "percent_under": float,   # ((q50 - cost) / q50) * 100
+    "effective_n": float,
+    "confidence": "low" | "medium" | "high"
+  }
+}
+```
+
+No-data shape (current behavior):
+
+```python
+{
+  "id": str,
+  "status": "no_data"
+}
+```
+
+Note: this no-data path is intentionally documented here because it is a different schema than success output and needs handling downstream.
+
+## 4) Sell Probability Model (`sell probablity model.py`)
+
+### 4.1 Core API
+
+- `estimate_sell_probability(row: Dict, horizon_days: int = 7, default_median_days: float = 21.0) -> Dict`
+
+### 4.2 Time-to-Sell Estimation
+
+For each sold comparable:
+
+- `time_to_sell_days = (sold_at_unix - seller.posted_at_unix) / 86400`
+
+Invalid values are discarded:
+
+- `days <= 0`
+- `days > 365`
+- missing timestamps
+
+`median_days` is median of valid values, or `default_median_days` if none exist.
+
+### 4.3 Price Ratio Adjustment
+
+- `live_price = live_listing.listing_price_usd + live_listing.shipping_price_usd`
+- `q50_comp_price = median(sold_total_price over comps with price > 0)`
+- `pricing_ratio = live_price / q50_comp_price` if valid, else `1.0`
+- `adjusted_days = max(median_days * pricing_ratio, 1.0)`
+
+### 4.4 Probability Mapping
+
+- `raw_p_sell = horizon_days / adjusted_days`
+- `p_sell = clamp(raw_p_sell, low=0.05, high=0.95)`
+
+Output:
+
+```python
+{
+  "p_sell": float,                # clamped [0.05, 0.95]
+  "horizon_days": int,
+  "median_days_to_sell": float,
+  "adjusted_days_to_sell": float,
+  "pricing_ratio": float,
+  "live_price": float,
+  "q50_comp_price": float | None,
+  "num_valid_time_comps": int,
+  "num_sold_comps": int
+}
+```
+
+## 5) Integration Notes
+
+- Distribution keys are `q10`, `q50`, `q90` and align with `shared.models.EVDistribution`.
+- `q50` in valuation output and `q50_comp_price` in sell probability output represent related but not identical calculations (weighted percentile vs simple median over sold comps).
+- Downstream callers should explicitly handle valuation no-data rows (`status == "no_data"`).
+
+## 6) Non-Goals in Current Implementation
+
+- No uncertainty calibration beyond simple confidence bucket thresholds.
+- No designer/category-specific hyperparameter tuning.
+- No guarantee that output dicts fully conform to Pydantic models unless validated by caller.
