@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -101,3 +103,35 @@ class GrailedScrapeResult(BaseModel):
 
     metadata: ScrapeMetadata
     results: list[GrailedResultRow] = Field(default_factory=list)
+
+
+class TrendPoint(BaseModel):
+    day_unix: int
+    intensity: int
+
+
+class TrendSeries(BaseModel):
+    range: Literal["7d", "30d", "90d"]
+    points: list[TrendPoint] = Field(default_factory=list)
+
+
+class RelatedQuery(BaseModel):
+    query: str
+    value: int
+    kind: Literal["rising", "top"]
+    is_breakout: bool
+
+
+class HypeEvidence(BaseModel):
+    related: list[RelatedQuery] = Field(default_factory=list)
+
+
+class HypeResult(BaseModel):
+    term: str
+    score: float | None
+    confidence: Literal["high", "medium", "low", "insufficient"]
+    series_30d: TrendSeries
+    series_7d: TrendSeries | None = None
+    series_90d: TrendSeries | None = None
+    evidence: HypeEvidence
+    fetched_at_unix: int
