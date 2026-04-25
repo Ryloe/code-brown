@@ -50,18 +50,71 @@ def extract_hits(raw: dict[str, Any]) -> list[dict[str, Any]]:
     return [h for h in hits if isinstance(h, dict)]
 
 
-def parse_live_hit(hit: dict[str, Any]) -> LiveListing:
-    return LiveListing.model_validate(_base_payload(hit))
+def parse_live_hit(
+    hit: dict[str, Any],
+    seller_stats: dict[int, tuple[int, int]] | None = None,
+) -> LiveListing:
+    return LiveListing.model_validate(_base_payload(hit, seller_stats))
 
 
-def parse_sold_hit(hit: dict[str, Any]) -> SoldListing:
-    payload = _base_payload(hit)
+def parse_sold_hit(
+    hit: dict[str, Any],
+    seller_stats: dict[int, tuple[int, int]] | None = None,
+) -> SoldListing:
+    payload = _base_payload(hit, seller_stats)
     payload["price"] = {
         "sold_price_usd": _coerce_int(hit.get("sold_price") or hit.get("price_i")),
         "shipping_price_usd": _coerce_int(hit.get("sold_shipping_price")),
     }
     payload["sold_at_unix"] = _coerce_int(hit.get("sold_at_i"))
     return SoldListing.model_validate(payload)
+
+
+def hit_user_id(hit: dict[str, Any]) -> int | None:
+    user = hit.get("user")
+    if not isinstance(user, dict):
+        return None
+    uid = user.get("id")
+    try:
+        return int(uid) if uid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_seller_stats_payload(user_id: int, index_name: str) -> dict[str, Any]:
+    """Single Algolia call yielding nbHits (items_for_sale_count) and all
+    accessible created_at_i timestamps (oldest used as posted_at_unix proxy).
+
+    hitsPerPage is capped at Algolia's 1000 max; sellers with >1000 listings
+    yield a lower-bound approximation for posted_at_unix.
+    """
+    encoded = urlencode(
+        {
+            "filters": f"user.id:{user_id}",
+            "hitsPerPage": "1000",
+            "page": "0",
+            "attributesToRetrieve": json.dumps(["created_at_i"]),
+            "attributesToHighlight": json.dumps([]),
+        }
+    )
+    return {"requests": [{"indexName": index_name, "params": encoded}]}
+
+
+def parse_seller_stats(raw: dict[str, Any]) -> tuple[int, int]:
+    """Returns (items_for_sale_count, posted_at_unix)."""
+    results = raw.get("results")
+    if not isinstance(results, list) or not results:
+        return (0, 0)
+    res = results[0]
+    nb_hits = _coerce_int(res.get("nbHits"))
+    timestamps = [
+        _coerce_int(h.get("created_at_i"))
+        for h in res.get("hits", [])
+        if isinstance(h, dict) and h.get("created_at_i")
+    ]
+    timestamps = [t for t in timestamps if t > 0]
+    posted_at = min(timestamps) if timestamps else 0
+    return (nb_hits, posted_at)
 
 
 def _encode_params(params: SearchParams) -> str:
@@ -103,12 +156,26 @@ def _encode_params(params: SearchParams) -> str:
     return urlencode(encoded)
 
 
-def _base_payload(hit: dict[str, Any]) -> dict[str, Any]:
+def _base_payload(
+    hit: dict[str, Any],
+    seller_stats: dict[int, tuple[int, int]] | None = None,
+) -> dict[str, Any]:
     listing_id = str(hit.get("id") or hit.get("objectID") or "")
     if not listing_id:
         raise SchemaValidationError("hit missing id/objectID")
 
-    seller = _extract_seller(hit.get("user") or {})
+    user_obj = hit.get("user") or {}
+    seller = _extract_seller(user_obj)
+    if seller_stats:
+        uid = user_obj.get("id") if isinstance(user_obj, dict) else None
+        try:
+            uid_int = int(uid) if uid is not None else None
+        except (TypeError, ValueError):
+            uid_int = None
+        if uid_int is not None and uid_int in seller_stats:
+            items_count, posted_at = seller_stats[uid_int]
+            seller["items_for_sale_count"] = items_count
+            seller["posted_at_unix"] = posted_at
     return {
         "id": listing_id,
         "url": f"https://www.grailed.com/listings/{listing_id}",

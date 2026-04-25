@@ -4,14 +4,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from scraper.algolia import (
     build_search_payload,
+    build_seller_stats_payload,
     build_sold_comparable_payload,
     extract_hits,
+    hit_user_id,
     parse_live_hit,
+    parse_seller_stats,
     parse_sold_hit,
 )
 from scraper.client import GrailedClient
@@ -77,17 +81,26 @@ async def scrape(
     ``ListingStore``; raises if no store wired.
     """
     async with GrailedClient() as client:
-        live_listings = await _fetch_live(client, params)
+        live_hits = await _search_live(client, params)
+        live_hits = live_hits[: params.live_limit]
+
+        sold_hits_per_live: list[list[dict[str, Any]]] = []
+        if params.include_sold:
+            sold_hits_per_live = await _search_sold_for_each(client, live_hits, params)
+
+        seller_stats = await _fetch_seller_stats(client, live_hits, sold_hits_per_live)
+
+        live_listings = [parse_live_hit(h, seller_stats) for h in live_hits]
 
         rows: list[GrailedResultRow] = []
-        for live in live_listings:
-            sold: list[SoldListing] = []
-            if params.include_sold:
-                sold = await _fetch_sold_for(client, live, params)
-                if persist:
-                    category = params.category or params.department or "unknown"
-                    for s in sold:
-                        _persist_sold(s, category=category)
+        for live, sold_hits in zip(
+            live_listings, sold_hits_per_live or [[] for _ in live_listings]
+        ):
+            sold = [parse_sold_hit(h, seller_stats) for h in sold_hits]
+            if persist and sold:
+                category = params.category or params.department or "unknown"
+                for s in sold:
+                    _persist_sold(s, category=category)
             rows.append(GrailedResultRow(live_listing=live, sold_comparables=sold))
 
     metadata = ScrapeMetadata(
@@ -101,19 +114,93 @@ async def scrape(
     return GrailedScrapeResult(metadata=metadata, results=rows)
 
 
-async def _fetch_live(
+async def _search_live(
     client: GrailedClient, params: SearchParams
-) -> list[LiveListing]:
+) -> list[dict[str, Any]]:
     payload = build_search_payload(params, ALGOLIA_LIVE_INDEX)
     raw = await client.post_json(ALGOLIA_SEARCH_URL, payload, headers=ALGOLIA_HEADERS)
-    hits = extract_hits(raw)[: params.live_limit]
-    return [parse_live_hit(h) for h in hits]
+    return extract_hits(raw)
 
 
-async def _fetch_sold_for(
-    client: GrailedClient, live: LiveListing, params: SearchParams
-) -> list[SoldListing]:
-    payload = build_sold_comparable_payload(live, params, ALGOLIA_SOLD_INDEX)
-    raw = await client.post_json(ALGOLIA_SEARCH_URL, payload, headers=ALGOLIA_HEADERS)
-    hits = extract_hits(raw)[: params.sold_limit]
-    return [parse_sold_hit(h) for h in hits]
+async def _search_sold_for_each(
+    client: GrailedClient, live_hits: list[dict[str, Any]], params: SearchParams
+) -> list[list[dict[str, Any]]]:
+    out: list[list[dict[str, Any]]] = []
+    for hit in live_hits:
+        live_for_query = LiveListing.model_validate(_minimal_live_for_query(hit))
+        payload = build_sold_comparable_payload(live_for_query, params, ALGOLIA_SOLD_INDEX)
+        raw = await client.post_json(ALGOLIA_SEARCH_URL, payload, headers=ALGOLIA_HEADERS)
+        sold_hits = extract_hits(raw)[: params.sold_limit]
+        out.append(sold_hits)
+    return out
+
+
+def _minimal_live_for_query(hit: dict[str, Any]) -> dict[str, Any]:
+    """Cheap stub for sold-comparable query construction; only ``name`` and
+    ``designer`` are read from the LiveListing."""
+    name = hit.get("title") or ""
+    designers = hit.get("designers") or []
+    designer = ""
+    if isinstance(designers, list) and designers:
+        first = designers[0]
+        if isinstance(first, dict):
+            designer = str(first.get("name") or "")
+    if not designer:
+        designer = str(hit.get("designer_names") or "")
+    listing_id = str(hit.get("id") or hit.get("objectID") or "0")
+    return {
+        "id": listing_id,
+        "url": f"https://www.grailed.com/listings/{listing_id}",
+        "designer": designer,
+        "name": name,
+        "size": "",
+        "condition_raw": "",
+        "location": "",
+        "color": "",
+        "image_urls": [],
+        "price": {"listing_price_usd": 0, "shipping_price_usd": 0},
+        "seller": {
+            "seller_name": "",
+            "reviews_count": 0,
+            "transactions_count": 0,
+            "items_for_sale_count": 0,
+            "posted_at_unix": 0,
+            "badges": {
+                "verified": False,
+                "trusted_seller": False,
+                "quick_responder": False,
+                "speedy_shipper": False,
+            },
+        },
+        "description": "",
+    }
+
+
+async def _fetch_seller_stats(
+    client: GrailedClient,
+    live_hits: list[dict[str, Any]],
+    sold_hits_per_live: list[list[dict[str, Any]]],
+) -> dict[int, tuple[int, int]]:
+    """For each unique seller across live + sold hits, fetch (items_for_sale_count,
+    posted_at_unix). Single Algolia query per unique user_id."""
+    user_ids: set[int] = set()
+    for h in live_hits:
+        uid = hit_user_id(h)
+        if uid is not None:
+            user_ids.add(uid)
+    for batch in sold_hits_per_live:
+        for h in batch:
+            uid = hit_user_id(h)
+            if uid is not None:
+                user_ids.add(uid)
+
+    if not user_ids:
+        return {}
+
+    async def fetch(uid: int) -> tuple[int, tuple[int, int]]:
+        payload = build_seller_stats_payload(uid, ALGOLIA_LIVE_INDEX)
+        raw = await client.post_json(ALGOLIA_SEARCH_URL, payload, headers=ALGOLIA_HEADERS)
+        return uid, parse_seller_stats(raw)
+
+    results = await asyncio.gather(*(fetch(uid) for uid in user_ids))
+    return dict(results)
