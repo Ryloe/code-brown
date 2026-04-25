@@ -21,3 +21,61 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.grailed.com/",
 }
+
+ALGOLIA_APP_ID = "MNRWEFSS2Q"
+ALGOLIA_API_KEY = "c89dbaddf15fe70e1941a109bf7c2a3d"
+ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/*/queries"
+ALGOLIA_LIVE_INDEX = "Listing_production"
+ALGOLIA_SOLD_INDEX = "Listing_sold_production"
+ALGOLIA_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Algolia-API-Key": ALGOLIA_API_KEY,
+    "X-Algolia-Application-Id": ALGOLIA_APP_ID,
+}
+ALGOLIA_FACETS = [
+    "badges",
+    "category",
+    "category_path",
+    "category_size",
+    "condition",
+    "department",
+    "designers.name",
+    "location",
+    "price_i",
+    "strata",
+]
+
+DEPARTMENT_VALUES = ["menswear", "womenswear"]
+CATEGORY_VALUES = [
+    "tops",
+    "bottoms",
+    "outerwear",
+    "footwear",
+    "accessories",
+    "tailoring",
+    "womens_tops",
+    "womens_bottoms",
+    "womens_outerwear",
+    "womens_footwear",
+    "womens_dresses",
+    "womens_accessories",
+    "womens_bags_luggage",
+    "womens_jewelry",
+]
+CONDITION_VALUES = [
+    "is_new",
+    "is_gently_used",
+    "is_used",
+    "is_worn",
+    "is_not_specified",
+]
+LOCATION_VALUES = [
+    "United States",
+    "Europe",
+    "Asia",
+    "Canada",
+    "United Kingdom",
+    "Australia/NZ",
+    "Other",
+]
+STRATA_VALUES = ["basic", "grailed", "hype", "sartorial"]
