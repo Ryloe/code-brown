@@ -20,7 +20,7 @@ pnpm-debug.log*
 !.env.sample
 
 # Python
-__pycache__/
+**/__pycache__/**
 *.py[cod]
 *.pyo
 *.pyd
@@ -65,3 +65,4 @@ tmp/
 temp/
 *.sqlite
 *.sqlite3
+.claude/
