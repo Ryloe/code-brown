@@ -135,3 +135,28 @@ class HypeResult(BaseModel):
     series_90d: TrendSeries | None = None
     evidence: HypeEvidence
     fetched_at_unix: int
+
+
+class RankedListing(BaseModel):
+    """One ranked search result: the live listing plus all model outputs.
+
+    ``valuation`` and ``sell_probability`` are kept as ``dict`` rather than
+    typed models because:
+      - The two EV model files emit raw dicts, not pydantic instances.
+      - ``valuation`` has two distinct shapes (success vs ``{"status": "no_data"}``)
+        and the ranker drops no_data rows, but we want flexibility to evolve the
+        success shape without churning the contract here.
+    Both dicts are passed through unchanged, so the EV spec is the source of truth.
+    """
+
+    live_listing: LiveListing
+    sold_comparables: list[SoldListing] = Field(default_factory=list)
+    valuation: dict
+    sell_probability: dict
+
+
+class SearchResponse(BaseModel):
+    """Full ranked search response. Returned by ``orchestrator.run_search``."""
+
+    metadata: ScrapeMetadata
+    ranked: list[RankedListing] = Field(default_factory=list)
