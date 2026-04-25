@@ -19,6 +19,7 @@ class SearchParams(BaseModel):
     live_limit: int = 5
     sold_limit: int = 3
     include_sold: bool = True
+    fetch_descriptions: bool = False
 
 
 class EVDistribution(BaseModel):
