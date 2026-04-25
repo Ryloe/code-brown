@@ -1,6 +1,8 @@
-"""Static config for the Grailed scraper. No env loading here."""
+"""Static config for the Grailed scraper."""
 
 from __future__ import annotations
+
+import os
 
 LIVE_CAP = 40
 SOLD_CAP_PER_LIVE = 40
@@ -50,7 +52,7 @@ BROWSER_HEADERS_JSON = {
 }
 
 ALGOLIA_APP_ID = "MNRWEFSS2Q"
-ALGOLIA_API_KEY = "c89dbaddf15fe70e1941a109bf7c2a3d"
+ALGOLIA_API_KEY = os.environ.get("ALGOLIA_API_KEY", "").strip()
 ALGOLIA_SEARCH_URL = f"https://{ALGOLIA_APP_ID.lower()}-dsn.algolia.net/1/indexes/*/queries"
 ALGOLIA_LIVE_INDEX = "Listing_production"
 ALGOLIA_SOLD_INDEX = "Listing_sold_production"
