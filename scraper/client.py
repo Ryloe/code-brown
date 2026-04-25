@@ -17,7 +17,10 @@ from tenacity import (
 )
 
 from scraper.config import (
+    BROWSER_HEADERS_HTML,
+    BROWSER_HEADERS_JSON,
     DEFAULT_HEADERS,
+    GRAILED_BASE_URL,
     MAX_CONCURRENCY,
     REQUEST_DELAY_RANGE,
     REQUEST_TIMEOUT_SEC,
@@ -54,12 +57,16 @@ class GrailedClient:
         self._max_429_attempts = max_429_attempts
         self._max_5xx_attempts = max_5xx_attempts
         self._client: httpx.AsyncClient | None = None
+        self._user_agent: str = random.choice(USER_AGENTS)
+        self._warmed_up: bool = False
+        self._warmup_lock: asyncio.Lock = asyncio.Lock()
 
     async def __aenter__(self) -> "GrailedClient":
         self._client = httpx.AsyncClient(
             http2=True,
             timeout=self._timeout,
             headers=DEFAULT_HEADERS,
+            follow_redirects=True,
         )
         return self
 
@@ -96,6 +103,31 @@ class GrailedClient:
         except _RateLimited as exc:
             raise GrailedRateLimitExceeded(str(exc)) from exc
 
+    async def get_listing_detail(self, listing_id: str) -> Any:
+        """Fetch full listing detail JSON (includes description) from Grailed.
+
+        Performs a one-shot warm-up against the public site to seed Cloudflare
+        cookies; subsequent calls reuse the cookie jar.
+        """
+        await self._ensure_warmed_up()
+        url = f"https://www.grailed.com/api/listings/{listing_id}"
+        return await self.get_json(url, headers=BROWSER_HEADERS_JSON)
+
+    async def _ensure_warmed_up(self) -> None:
+        if self._warmed_up:
+            return
+        async with self._warmup_lock:
+            if self._warmed_up:
+                return
+            if self._client is None:
+                raise RuntimeError("GrailedClient not entered")
+            headers = {"User-Agent": self._user_agent, **BROWSER_HEADERS_HTML}
+            try:
+                await self._client.get(GRAILED_BASE_URL, headers=headers)
+            except httpx.HTTPError:
+                pass
+            self._warmed_up = True
+
     async def post_json(
         self,
         url: str,
@@ -128,7 +160,7 @@ class GrailedClient:
         if self._client is None:
             raise RuntimeError("GrailedClient not entered")
 
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        headers = {"User-Agent": self._user_agent}
         if extra_headers is not None:
             headers.update(extra_headers)
 
@@ -153,7 +185,7 @@ class GrailedClient:
         if self._client is None:
             raise RuntimeError("GrailedClient not entered")
 
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        headers = {"User-Agent": self._user_agent}
         if extra_headers is not None:
             headers.update(extra_headers)
 

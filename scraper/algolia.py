@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 
 from scraper.config import ALGOLIA_FACETS
 from scraper.exceptions import SchemaValidationError
-from shared.models import LiveListing, SearchParams, SoldListing
+from shared.models import SearchParams, SoldListing, LiveListing
 
 
 def build_search_payload(params: SearchParams, index_name: str) -> dict[str, Any]:
@@ -24,16 +24,34 @@ def build_search_payload(params: SearchParams, index_name: str) -> dict[str, Any
 
 
 def build_sold_comparable_payload(
-    live: LiveListing, params: SearchParams, index_name: str
+    live_hit: dict[str, Any], params: SearchParams, index_name: str
 ) -> dict[str, Any]:
     """Search the sold index for comparables of a given live listing.
 
-    Scopes by designer to keep matches relevant; falls back to title query.
+    Narrows match by carrying the live hit's category, condition, size, and
+    color into the sold query. Size and color have no clean Algolia facet, so
+    they are folded into the query text. Tighter filters mean some live
+    listings yield very few sold comparables — acceptable: arbitrage targets
+    are the items that *do* surface dense sold history.
     """
+    name = str(live_hit.get("title") or "")
+    designer = _extract_designer(live_hit)
+    size = str(live_hit.get("size") or "")
+    color = str(live_hit.get("color") or "")
+    condition = str(live_hit.get("condition") or "")
+    category = str(live_hit.get("category") or "")
+    category_path = str(live_hit.get("category_path") or "")
+    department = str(live_hit.get("department") or "")
+
+    query_parts = [p for p in (name, color, size) if p]
     derived = params.model_copy(
         update={
-            "query": live.name,
-            "designer": live.designer or params.designer,
+            "query": " ".join(query_parts),
+            "designer": designer or params.designer,
+            "condition": condition or params.condition,
+            "category": category or params.category,
+            "category_path": category_path or params.category_path,
+            "department": department or params.department,
             "live_limit": params.sold_limit,
         }
     )
@@ -53,15 +71,22 @@ def extract_hits(raw: dict[str, Any]) -> list[dict[str, Any]]:
 def parse_live_hit(
     hit: dict[str, Any],
     seller_stats: dict[int, tuple[int, int]] | None = None,
+    descriptions: dict[str, str] | None = None,
 ) -> LiveListing:
-    return LiveListing.model_validate(_base_payload(hit, seller_stats))
+    payload = _base_payload(hit, seller_stats)
+    if descriptions:
+        payload["description"] = descriptions.get(payload["id"], "")
+    return LiveListing.model_validate(payload)
 
 
 def parse_sold_hit(
     hit: dict[str, Any],
     seller_stats: dict[int, tuple[int, int]] | None = None,
+    descriptions: dict[str, str] | None = None,
 ) -> SoldListing:
     payload = _base_payload(hit, seller_stats)
+    if descriptions:
+        payload["description"] = descriptions.get(payload["id"], "")
     payload["price"] = {
         "sold_price_usd": _coerce_int(hit.get("sold_price") or hit.get("price_i")),
         "shipping_price_usd": _coerce_int(hit.get("sold_shipping_price")),

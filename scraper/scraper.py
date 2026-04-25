@@ -28,7 +28,6 @@ from scraper.config import (
 from shared.models import (
     GrailedResultRow,
     GrailedScrapeResult,
-    LiveListing,
     ScrapeMetadata,
     SearchParams,
     SoldListing,
@@ -88,20 +87,34 @@ async def scrape(
         if params.include_sold:
             sold_hits_per_live = await _search_sold_for_each(client, live_hits, params)
 
-        seller_stats = await _fetch_seller_stats(client, live_hits, sold_hits_per_live)
+        cached_per_live, uncached_per_live = _partition_sold_by_cache(
+            sold_hits_per_live, use_cache=persist and _store is not None
+        )
 
-        live_listings = [parse_live_hit(h, seller_stats) for h in live_hits]
+        seller_stats = await _fetch_seller_stats(client, live_hits, uncached_per_live)
+
+        descriptions: dict[str, str] = {}
+        if params.fetch_descriptions:
+            descriptions = await _fetch_descriptions(
+                client, live_hits, uncached_per_live
+            )
+
+        live_listings = [
+            parse_live_hit(h, seller_stats, descriptions) for h in live_hits
+        ]
 
         rows: list[GrailedResultRow] = []
-        for live, sold_hits in zip(
-            live_listings, sold_hits_per_live or [[] for _ in live_listings]
+        for live, uncached_hits, cached in zip(
+            live_listings,
+            uncached_per_live or [[] for _ in live_listings],
+            cached_per_live or [[] for _ in live_listings],
         ):
-            sold = [parse_sold_hit(h, seller_stats) for h in sold_hits]
-            if persist and sold:
+            fresh = [parse_sold_hit(h, seller_stats, descriptions) for h in uncached_hits]
+            if persist and fresh:
                 category = params.category or params.department or "unknown"
-                for s in sold:
+                for s in fresh:
                     _persist_sold(s, category=category)
-            rows.append(GrailedResultRow(live_listing=live, sold_comparables=sold))
+            rows.append(GrailedResultRow(live_listing=live, sold_comparables=cached + fresh))
 
     metadata = ScrapeMetadata(
         query=params.query,
@@ -127,53 +140,76 @@ async def _search_sold_for_each(
 ) -> list[list[dict[str, Any]]]:
     out: list[list[dict[str, Any]]] = []
     for hit in live_hits:
-        live_for_query = LiveListing.model_validate(_minimal_live_for_query(hit))
-        payload = build_sold_comparable_payload(live_for_query, params, ALGOLIA_SOLD_INDEX)
+        payload = build_sold_comparable_payload(hit, params, ALGOLIA_SOLD_INDEX)
         raw = await client.post_json(ALGOLIA_SEARCH_URL, payload, headers=ALGOLIA_HEADERS)
         sold_hits = extract_hits(raw)[: params.sold_limit]
         out.append(sold_hits)
     return out
 
 
-def _minimal_live_for_query(hit: dict[str, Any]) -> dict[str, Any]:
-    """Cheap stub for sold-comparable query construction; only ``name`` and
-    ``designer`` are read from the LiveListing."""
-    name = hit.get("title") or ""
-    designers = hit.get("designers") or []
-    designer = ""
-    if isinstance(designers, list) and designers:
-        first = designers[0]
-        if isinstance(first, dict):
-            designer = str(first.get("name") or "")
-    if not designer:
-        designer = str(hit.get("designer_names") or "")
-    listing_id = str(hit.get("id") or hit.get("objectID") or "0")
-    return {
-        "id": listing_id,
-        "url": f"https://www.grailed.com/listings/{listing_id}",
-        "designer": designer,
-        "name": name,
-        "size": "",
-        "condition_raw": "",
-        "location": "",
-        "color": "",
-        "image_urls": [],
-        "price": {"listing_price_usd": 0, "shipping_price_usd": 0},
-        "seller": {
-            "seller_name": "",
-            "reviews_count": 0,
-            "transactions_count": 0,
-            "items_for_sale_count": 0,
-            "posted_at_unix": 0,
-            "badges": {
-                "verified": False,
-                "trusted_seller": False,
-                "quick_responder": False,
-                "speedy_shipper": False,
-            },
-        },
-        "description": "",
-    }
+def _partition_sold_by_cache(
+    sold_hits_per_live: list[list[dict[str, Any]]], *, use_cache: bool
+) -> tuple[list[list[SoldListing]], list[list[dict[str, Any]]]]:
+    """For each live listing's sold hits, split into (cached, uncached).
+
+    Cached: ID already in store — load full SoldListing from DB, skip Algolia
+    re-parse and downstream seller_stats/description fetches.
+    Uncached: parse fresh from Algolia hit and (optionally) persist later.
+    ``use_cache=False`` short-circuits: everything treated as uncached.
+    """
+    cached_per_live: list[list[SoldListing]] = []
+    uncached_per_live: list[list[dict[str, Any]]] = []
+    store = _store if use_cache else None
+    for hits in sold_hits_per_live:
+        cached: list[SoldListing] = []
+        uncached: list[dict[str, Any]] = []
+        for h in hits:
+            hid = str(h.get("id") or h.get("objectID") or "")
+            if store and hid and store.has_listing(hid):
+                row = store.get_listing(hid)
+                if row:
+                    cached.append(SoldListing.model_validate(row))
+                    continue
+            uncached.append(h)
+        cached_per_live.append(cached)
+        uncached_per_live.append(uncached)
+    return cached_per_live, uncached_per_live
+
+
+async def _fetch_descriptions(
+    client: GrailedClient,
+    live_hits: list[dict[str, Any]],
+    sold_hits_per_live: list[list[dict[str, Any]]],
+) -> dict[str, str]:
+    """Fetch listing detail per id and extract description. Failures yield ''."""
+    listing_ids: list[str] = []
+    seen: set[str] = set()
+    for h in live_hits:
+        lid = str(h.get("id") or h.get("objectID") or "")
+        if lid and lid not in seen:
+            seen.add(lid)
+            listing_ids.append(lid)
+    for batch in sold_hits_per_live:
+        for h in batch:
+            lid = str(h.get("id") or h.get("objectID") or "")
+            if lid and lid not in seen:
+                seen.add(lid)
+                listing_ids.append(lid)
+
+    if not listing_ids:
+        return {}
+
+    async def fetch_one(lid: str) -> tuple[str, str]:
+        try:
+            raw = await client.get_listing_detail(lid)
+        except Exception:
+            return lid, ""
+        inner = raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw
+        desc = inner.get("description") if isinstance(inner, dict) else None
+        return lid, str(desc) if isinstance(desc, str) else ""
+
+    results = await asyncio.gather(*(fetch_one(i) for i in listing_ids))
+    return dict(results)
 
 
 async def _fetch_seller_stats(
