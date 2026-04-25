@@ -3,6 +3,24 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class SearchParams(BaseModel):
+    """User-facing filters for a Grailed scrape run."""
+
+    query: str = ""
+    department: str | None = None  # "menswear" | "womenswear" | None
+    category: str | None = None  # e.g. "tops", "footwear"; matches Algolia `category` facet
+    category_path: str | None = None  # optional dotted path, e.g. "tops.short_sleeve_shirts"
+    condition: str | None = None  # "is_new" | "is_gently_used" | "is_used" | "is_worn" | None
+    location: str | None = None  # "United States" | "Europe" | "Asia" | ...
+    strata: str | None = None  # "basic" | "grailed" | "hype" | "sartorial" | None
+    designer: str | None = None  # matches `designers.name` facet
+    min_price_usd: int = 0
+    max_price_usd: int = 1_000_000
+    live_limit: int = 5
+    sold_limit: int = 3
+    include_sold: bool = True
+
+
 class EVDistribution(BaseModel):
     q10: float
     q50: float
